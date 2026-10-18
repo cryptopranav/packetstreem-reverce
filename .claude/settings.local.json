@@ -1,0 +1,22 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node \"${CLAUDE_PROJECT_DIR:-.}/.trail/statusline.cjs\""
+  },
+  "subagentStatusLine": {
+    "type": "command",
+    "command": "node \"${CLAUDE_PROJECT_DIR:-.}/.trail/statusline.cjs\""
+  },
+  "footerLinksRegexes": [
+    "graft/[\\w./-]+\\.md"
+  ],
+  "permissions": {
+    "allow": [
+      "Bash(trail:*)",
+      "Bash(graft:*)",
+      "Bash(npx graft:*)",
+      "Bash(graft-dev:*)",
+      "Bash(node dist/cli.js:*)"
+    ]
+  }
+}

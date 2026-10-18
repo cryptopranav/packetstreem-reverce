@@ -1,0 +1,10 @@
+# PacketStream Autonomous Python Client
+#
+# Requirements:
+# Python 3.10+
+#
+# Note: The client uses 100% Python Standard Library modules (asyncio, ssl, urllib, socket, struct).
+# Zero external packages are strictly required!
+#
+# Optional development / analysis tools:
+pytest>=7.0.0
