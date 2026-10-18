@@ -15,7 +15,15 @@ from packetstream.security import (
     resolve_and_validate_destination,
     SecurityError
 )
-from packetstream.yamux import YamuxSession, YamuxStream
+from packetstream.yamux import (
+    YamuxSession,
+    YamuxStream,
+    FLAG_SYN,
+    FLAG_ACK,
+    FLAG_FIN,
+    STREAM_SYN_RECEIVED,
+    STREAM_ESTABLISHED
+)
 from packetstream.proxy import (
     TrafficStats,
     pipe_bidirectional,
@@ -106,6 +114,98 @@ class TestPacketStreamSecurity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(addrs[0][4], ("1.1.1.1", 443))
 
 
+class TestPacketStreamYamux(unittest.IsolatedAsyncioTestCase):
+    async def test_yamux_ping_protocol(self):
+        """Verifies HashiCorp Yamux ping/pong specification (SYN request, ACK response)."""
+        s1, s2 = socket.socketpair()
+        r1, w1 = await asyncio.open_connection(sock=s1)
+        r2, w2 = await asyncio.open_connection(sock=s2)
+
+        server = YamuxSession(r1, w1, is_server=True)
+        client = YamuxSession(r2, w2, is_server=False)
+        server.start()
+        client.start()
+
+        try:
+            # Client pings server: verifies ping resolves with no timeout
+            await client.ping(timeout=2.0)
+
+            # Server pings client: verifies bi-directional ping support
+            await server.ping(timeout=2.0)
+        finally:
+            await client.close()
+            await server.close()
+
+    async def test_yamux_stream_establishment_and_flags(self):
+        """Verifies that incoming streams transition to established and send FLAG_ACK on first response."""
+        s1, s2 = socket.socketpair()
+        r1, w1 = await asyncio.open_connection(sock=s1)
+        r2, w2 = await asyncio.open_connection(sock=s2)
+
+        server = YamuxSession(r1, w1, is_server=True)
+        client = YamuxSession(r2, w2, is_server=False)
+        server.start()
+        client.start()
+
+        try:
+            # Client opens a stream
+            client_stream = await client.open()
+
+            # Server accepts incoming stream
+            server_stream = await server.accept()
+            self.assertEqual(server_stream.stream_id, client_stream.stream_id)
+            self.assertEqual(server_stream.state, STREAM_SYN_RECEIVED)
+
+            # Server writes first response: triggers sendFlags() -> FLAG_ACK
+            await server_stream.write(b"ACK_AND_DATA")
+            self.assertEqual(server_stream.state, STREAM_ESTABLISHED)
+
+            # Client reads response
+            data = await client_stream.read(12)
+            self.assertEqual(data, b"ACK_AND_DATA")
+        finally:
+            await client.close()
+            await server.close()
+
+    async def test_yamux_large_transfer_flow_control(self):
+        """Verifies Yamux window replenishment under transfers exceeding initial 256KB stream window."""
+        s1, s2 = socket.socketpair()
+        r1, w1 = await asyncio.open_connection(sock=s1)
+        r2, w2 = await asyncio.open_connection(sock=s2)
+
+        server = YamuxSession(r1, w1, is_server=True)
+        client = YamuxSession(r2, w2, is_server=False)
+        server.start()
+        client.start()
+
+        # Transfer 600 KB (> 2x INITIAL_STREAM_WINDOW of 256 KB)
+        payload = b"X" * (600 * 1024)
+
+        async def server_worker():
+            stream = await server.accept()
+            # Send the large payload
+            await stream.write(payload)
+            await stream.close()
+
+        server_task = asyncio.create_task(server_worker())
+
+        try:
+            client_stream = await client.open()
+            received = bytearray()
+            while True:
+                chunk = await client_stream.read(65536)
+                if not chunk:
+                    break
+                received.extend(chunk)
+
+            await server_task
+            self.assertEqual(len(received), len(payload))
+            self.assertEqual(bytes(received), payload)
+        finally:
+            await client.close()
+            await server.close()
+
+
 class TestPacketStreamYamuxAndProxy(unittest.IsolatedAsyncioTestCase):
     async def test_yamux_and_proxy_pipeline(self):
         # Start a dummy destination HTTP server
@@ -160,6 +260,67 @@ class TestPacketStreamYamuxAndProxy(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(stats.bytes_downloaded, 0)
         self.assertGreater(stats.bytes_uploaded, 0)
+
+        await yamux_client.close()
+        await yamux_server.close()
+        server.close()
+        await server.wait_closed()
+
+    async def test_http_connect_proxy_pipeline(self):
+        from unittest.mock import patch
+
+        async def echo_server_handler(reader, writer):
+            data = await reader.read(4)
+            if data == b"PING":
+                writer.write(b"PONG")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(echo_server_handler, "127.0.0.1", 0)
+        server_port = server.sockets[0].getsockname()[1]
+
+        s1, s2 = socket.socketpair()
+        r1, w1 = await asyncio.open_connection(sock=s1)
+        r2, w2 = await asyncio.open_connection(sock=s2)
+
+        yamux_server = YamuxSession(r1, w1, is_server=True)
+        yamux_client = YamuxSession(r2, w2, is_server=False)
+        yamux_server.start()
+        yamux_client.start()
+
+        from packetstream.proxy import handle_http_request
+        stats = TrafficStats()
+
+        with patch("packetstream.proxy.resolve_and_validate_destination") as mock_resolve:
+            mock_resolve.return_value = [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", server_port))
+            ]
+
+            async def server_worker():
+                st = await yamux_server.accept()
+                await handle_http_request(st, stats=stats)
+
+            srv_task = asyncio.create_task(server_worker())
+
+            client_st = await yamux_client.open()
+            await client_st.write(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+
+            resp_line = await client_st.readline()
+            self.assertIn(b"200 Connection Established", resp_line)
+            # Read blank line
+            blank = await client_st.readline()
+            self.assertEqual(blank, b"\r\n")
+
+            # Send payload through the tunnel
+            await client_st.write(b"PING")
+            echo = await client_st.read(4)
+            self.assertEqual(echo, b"PONG")
+
+            await client_st.close()
+            await srv_task
+
+        self.assertGreater(stats.bytes_uploaded, 0)
+        self.assertGreater(stats.bytes_downloaded, 0)
 
         await yamux_client.close()
         await yamux_server.close()

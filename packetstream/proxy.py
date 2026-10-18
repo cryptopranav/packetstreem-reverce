@@ -85,7 +85,8 @@ async def pipe_bidirectional(
             logger.debug(f"Stream -> Target pipe closed: {e}")
         finally:
             try:
-                target_writer.close()
+                if target_writer.can_write_eof():
+                    target_writer.write_eof()
             except Exception:
                 pass
 
@@ -107,6 +108,15 @@ async def pipe_bidirectional(
                 pass
 
     await asyncio.gather(stream_to_target(), target_to_stream(), return_exceptions=True)
+    try:
+        target_writer.close()
+        await target_writer.wait_closed()
+    except Exception:
+        pass
+    try:
+        await stream.close()
+    except Exception:
+        pass
 
 
 async def handle_http_request(

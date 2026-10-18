@@ -1,13 +1,16 @@
 """
 Hashicorp Yamux (Yet Another Multiplexer) Protocol Implementation in Pure Python.
-Fully implements Yamux v0 specification (framing, flow control, window updates, ping/keepalive).
-Supports both Client (odd stream IDs) and Server (even stream IDs) modes.
+Fully implements Yamux v0 specification matching HashiCorp Yamux v0.1.2:
+- 12-byte header: [version:1, type:1, flags:2, stream_id:4, length:4] (Big-Endian)
+- Framing, flow control, receive/send window updates
+- State-driven stream management (SYN, ACK, FIN, RST)
+- Keepalive ping/pong adhering to Yamux v0 specification (SYN request, ACK response)
 """
 
 import asyncio
 import logging
 import struct
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 logger = logging.getLogger("packetstream.yamux")
 
@@ -31,8 +34,18 @@ GO_AWAY_NORMAL = 0x0
 GO_AWAY_PROTO_ERR = 0x1
 GO_AWAY_INTERNAL_ERR = 0x2
 
+# Stream States (matching HashiCorp Yamux)
+STREAM_INIT = 0
+STREAM_SYN_SENT = 1
+STREAM_SYN_RECEIVED = 2
+STREAM_ESTABLISHED = 3
+STREAM_LOCAL_CLOSE = 4
+STREAM_REMOTE_CLOSE = 5
+STREAM_CLOSED = 6
+STREAM_RESET = 7
+
 # Flow Control & Buffering
-INITIAL_STREAM_WINDOW = 256 * 1024  # 256 KB default in Hashicorp Yamux
+INITIAL_STREAM_WINDOW = 256 * 1024  # 256 KB default in HashiCorp Yamux
 MAX_PAYLOAD_SIZE = 64 * 1024        # 64 KB per data frame chunk
 HEADER_STRUCT = struct.Struct(">BBHII")  # version, type, flags, stream_id, length
 HEADER_SIZE = 12
@@ -46,11 +59,12 @@ class YamuxError(Exception):
 class YamuxStream:
     """
     Represents a single multiplexed stream within a Yamux session.
-    Provides standard async read/write stream interface.
+    Provides standard async read/write stream interface matching asyncio.StreamReader / StreamWriter.
     """
-    def __init__(self, session: "YamuxSession", stream_id: int):
+    def __init__(self, session: "YamuxSession", stream_id: int, state: int = STREAM_INIT):
         self.session = session
         self.stream_id = stream_id
+        self.state = state
 
         # Flow control windows
         self.send_window = INITIAL_STREAM_WINDOW
@@ -66,6 +80,22 @@ class YamuxStream:
         self.write_closed = False
         self.reset_occurred = False
         self._lock = asyncio.Lock()
+
+    def _send_flags(self) -> int:
+        """
+        Determines control flags to send based on stream state.
+        Replicates Yamux Stream.sendFlags:
+        - STREAM_INIT -> FLAG_SYN (outbound open)
+        - STREAM_SYN_RECEIVED -> FLAG_ACK (acknowledges inbound stream on first frame)
+        """
+        flags = 0
+        if self.state == STREAM_INIT:
+            flags |= FLAG_SYN
+            self.state = STREAM_SYN_SENT
+        elif self.state == STREAM_SYN_RECEIVED:
+            flags |= FLAG_ACK
+            self.state = STREAM_ESTABLISHED
+        return flags
 
     async def read(self, n: int = -1) -> bytes:
         """
@@ -84,14 +114,13 @@ class YamuxStream:
                 if not self._recv_buf:
                     self._data_event.clear()
 
-                # Flow control: check if we need to replenish receive window
+                # Replenish receive window if needed
                 await self._check_replenish_recv_window(len(data))
                 return data
 
             if self.read_closed or self.reset_occurred:
                 return b""
 
-            # Wait for data or state change
             await self._data_event.wait()
 
     async def readexactly(self, n: int) -> bytes:
@@ -110,7 +139,6 @@ class YamuxStream:
         while True:
             idx = self._recv_buf.find(b"\n")
             if idx != -1:
-                # Found newline in current buffer
                 line = bytes(self._recv_buf[: idx + 1])
                 del self._recv_buf[: idx + 1]
                 if not self._recv_buf:
@@ -132,19 +160,26 @@ class YamuxStream:
             await self._data_event.wait()
 
     async def _check_replenish_recv_window(self, bytes_consumed: int) -> None:
-        """Replenishes receive window if it dropped below threshold."""
-        self.recv_window -= bytes_consumed
-        if self.recv_window <= (INITIAL_STREAM_WINDOW // 2) and not self.read_closed:
+        """
+        Replenishes receive window if consumed data drops window below 50%.
+        Replicates Yamux Stream.sendWindowUpdate.
+        """
+        if self.read_closed or self.reset_occurred or self.session._closed:
+            return
+
+        # Check if replenishment is needed
+        if self.recv_window <= (INITIAL_STREAM_WINDOW // 2):
             delta = INITIAL_STREAM_WINDOW - self.recv_window
             self.recv_window += delta
+            flags = self._send_flags()
             try:
-                await self.session._send_window_update(self.stream_id, delta)
+                await self.session._send_window_update(self.stream_id, delta, flags=flags)
             except Exception as e:
                 logger.debug(f"Stream {self.stream_id}: failed to send window update: {e}")
 
     async def write(self, data: bytes) -> None:
-        """Writes data to the stream, handling chunking and flow control window."""
-        if self.write_closed or self.reset_occurred:
+        """Writes data to the stream, respecting flow control window."""
+        if self.write_closed or self.reset_occurred or self.session._closed:
             raise ConnectionResetError(f"Stream {self.stream_id} is closed for writing")
 
         offset = 0
@@ -153,28 +188,32 @@ class YamuxStream:
         while offset < total:
             chunk_size = min(total - offset, MAX_PAYLOAD_SIZE)
 
-            # Wait for send window to be available
             async with self._window_cond:
-                while self.send_window <= 0 and not self.write_closed and not self.reset_occurred:
+                while self.send_window <= 0 and not self.write_closed and not self.reset_occurred and not self.session._closed:
                     await self._window_cond.wait()
 
-                if self.write_closed or self.reset_occurred:
+                if self.write_closed or self.reset_occurred or self.session._closed:
                     raise ConnectionResetError(f"Stream {self.stream_id} closed during write")
 
                 allowed = min(chunk_size, self.send_window)
                 self.send_window -= allowed
 
             chunk = data[offset : offset + allowed]
-            await self.session._send_data(self.stream_id, chunk)
+            flags = self._send_flags()
+            await self.session._send_data(self.stream_id, chunk, flags=flags)
             offset += allowed
 
     async def close(self) -> None:
-        """Closes the write side of the stream by sending a FIN frame."""
+        """
+        Closes the write side of the stream (sends FIN flag).
+        Replicates Yamux Stream.sendClose.
+        """
         async with self._lock:
             if not self.write_closed:
                 self.write_closed = True
+                flags = self._send_flags() | FLAG_FIN
                 try:
-                    await self.session._send_frame(TYPE_DATA, FLAG_FIN, self.stream_id, 0)
+                    await self.session._send_frame(TYPE_WINDOW_UPDATE, flags, self.stream_id, 0)
                 except Exception:
                     pass
                 async with self._window_cond:
@@ -189,7 +228,7 @@ class YamuxStream:
                 self.read_closed = True
                 self.write_closed = True
                 try:
-                    await self.session._send_frame(TYPE_DATA, FLAG_RST, self.stream_id, 0)
+                    await self.session._send_frame(TYPE_WINDOW_UPDATE, FLAG_RST, self.stream_id, 0)
                 except Exception:
                     pass
                 self._data_event.set()
@@ -200,6 +239,7 @@ class YamuxStream:
     def _push_data(self, data: bytes) -> None:
         """Called by session when new data frame arrives for this stream."""
         if not self.read_closed and not self.reset_occurred:
+            self.recv_window = max(0, self.recv_window - len(data))
             self._recv_buf.extend(data)
             self._data_event.set()
 
@@ -208,14 +248,24 @@ class YamuxStream:
         self.send_window += delta
         self._window_cond.notify_all()
 
+    def _on_remote_ack(self) -> None:
+        """Called when ACK flag is received from peer for this stream."""
+        if self.state == STREAM_SYN_SENT:
+            self.state = STREAM_ESTABLISHED
+
     def _on_remote_fin(self) -> None:
         """Called by session when remote peer sent FIN."""
         self.read_closed = True
+        if self.state == STREAM_LOCAL_CLOSE:
+            self.state = STREAM_CLOSED
+        else:
+            self.state = STREAM_REMOTE_CLOSE
         self._data_event.set()
         self._maybe_remove_from_session()
 
     def _on_remote_rst(self) -> None:
         """Called by session when remote peer sent RST."""
+        self.state = STREAM_RESET
         self.reset_occurred = True
         self.read_closed = True
         self.write_closed = True
@@ -300,15 +350,20 @@ class YamuxSession:
             stream_id = self._next_stream_id
             self._next_stream_id += 2
 
-            stream = YamuxStream(self, stream_id)
+            stream = YamuxStream(self, stream_id, state=STREAM_INIT)
+            flags = stream._send_flags()  # returns FLAG_SYN, transitions to STREAM_SYN_SENT
             self._streams[stream_id] = stream
 
-            # Send SYN frame
-            await self._send_frame_locked(TYPE_DATA, FLAG_SYN, stream_id, 0)
+            # HashiCorp Yamux sends typeWindowUpdate with SYN flag to open stream
+            await self._send_frame_locked(TYPE_WINDOW_UPDATE, flags, stream_id, 0)
             return stream
 
-    async def ping(self, timeout: float = 10.0) -> None:
-        """Sends a PING frame to remote peer and waits for ACK."""
+    async def ping(self, timeout: float = 15.0) -> None:
+        """
+        Sends a Yamux PING frame to remote peer and waits for ACK.
+        In Yamux specification, Ping request MUST have FLAG_SYN set (flags=1).
+        Length contains the ping sequence number.
+        """
         if self._closed:
             raise YamuxError("Yamux session is closed")
 
@@ -319,7 +374,8 @@ class YamuxSession:
             self._ping_seq = (self._ping_seq + 1) & 0xFFFFFFFF
             seq = self._ping_seq
             self._ping_futures[seq] = future
-            await self._send_frame_locked(TYPE_PING, 0, 0, seq)
+            # HashiCorp Yamux: Session.Ping encodes typePing, flagSYN, 0, pingID
+            await self._send_frame_locked(TYPE_PING, FLAG_SYN, 0, seq)
 
         try:
             await asyncio.wait_for(future, timeout=timeout)
@@ -367,32 +423,41 @@ class YamuxSession:
         self.writer.write(hdr)
         await self.writer.drain()
 
-    async def _send_data(self, stream_id: int, data: bytes) -> None:
+    async def _send_data(self, stream_id: int, data: bytes, flags: int = 0) -> None:
         async with self._write_lock:
-            hdr = HEADER_STRUCT.pack(YAMUX_VERSION, TYPE_DATA, 0, stream_id, len(data))
+            hdr = HEADER_STRUCT.pack(YAMUX_VERSION, TYPE_DATA, flags, stream_id, len(data))
             self.writer.write(hdr)
             self.writer.write(data)
             await self.writer.drain()
 
-    async def _send_window_update(self, stream_id: int, delta: int) -> None:
-        await self._send_frame(TYPE_WINDOW_UPDATE, 0, stream_id, delta)
+    async def _send_window_update(self, stream_id: int, delta: int, flags: int = 0) -> None:
+        await self._send_frame(TYPE_WINDOW_UPDATE, flags, stream_id, delta)
 
     def _remove_stream(self, stream_id: int) -> None:
         self._streams.pop(stream_id, None)
 
     async def _keepalive_loop(self) -> None:
-        """Sends periodic Yamux Ping to maintain connection and detect stale sessions."""
+        """
+        Sends periodic Yamux Ping to maintain connection and detect stale sessions.
+        Includes a retry before disconnecting to prevent spurious disconnects on transient jitter.
+        """
         try:
             while not self._closed:
                 await asyncio.sleep(self.keepalive_interval)
                 if self._closed:
                     break
                 try:
-                    await self.ping(timeout=10.0)
+                    await self.ping(timeout=15.0)
                 except Exception as e:
-                    logger.warning(f"Yamux keepalive ping failed: {e}")
-                    await self.close(GO_AWAY_PROTO_ERR)
-                    break
+                    logger.warning(f"Yamux keepalive ping failed: {e}. Retrying once...")
+                    try:
+                        await asyncio.sleep(1.0)
+                        await self.ping(timeout=15.0)
+                        logger.info("Yamux keepalive ping retry succeeded!")
+                    except Exception as retry_err:
+                        logger.warning(f"Yamux keepalive ping retry failed: {retry_err}. Closing session.")
+                        await self.close(GO_AWAY_PROTO_ERR)
+                        break
         except asyncio.CancelledError:
             pass
 
@@ -418,7 +483,7 @@ class YamuxSession:
                     await self._handle_window_update(stream_id, flags, length)
 
                 elif msg_type == TYPE_PING:
-                    await self._handle_ping(flags, length)
+                    self._handle_ping(flags, length)
 
                 elif msg_type == TYPE_GO_AWAY:
                     logger.info(f"Received Yamux GO_AWAY (code={length}) from peer")
@@ -440,64 +505,72 @@ class YamuxSession:
             await self.close(GO_AWAY_NORMAL)
 
     async def _handle_data_frame(self, stream_id: int, flags: int, data: bytes) -> None:
-        # Handle SYN (New Stream)
         stream = self._streams.get(stream_id)
+
+        # Handle SYN (New incoming stream initiated by peer)
         if flags & FLAG_SYN:
             if stream is None:
-                stream = YamuxStream(self, stream_id)
+                stream = YamuxStream(self, stream_id, state=STREAM_SYN_RECEIVED)
                 self._streams[stream_id] = stream
-                await self._accept_queue.put(stream)
-            # Send ACK if required by spec
-            if not (flags & FLAG_ACK):
-                try:
-                    await self._send_frame(TYPE_DATA, FLAG_ACK, stream_id, 0)
-                except Exception:
-                    pass
+                # Push any initial data payload before queuing for accept
+                if data:
+                    stream._push_data(data)
+                self._accept_queue.put_nowait(stream)
+            else:
+                if data:
+                    stream._push_data(data)
+        else:
+            if stream is None:
+                # Discard data for closed / unknown stream
+                return
+            if data:
+                stream._push_data(data)
 
-        if stream is None:
-            # Stream unknown, may have already been closed/reset
-            if not (flags & FLAG_RST):
-                try:
-                    await self._send_frame(TYPE_DATA, FLAG_RST, stream_id, 0)
-                except Exception:
-                    pass
-            return
+        if flags & FLAG_ACK:
+            stream._on_remote_ack()
 
         if flags & FLAG_RST:
             stream._on_remote_rst()
-            return
-
-        if data:
-            stream._push_data(data)
-
-        if flags & FLAG_FIN:
+        elif flags & FLAG_FIN:
             stream._on_remote_fin()
 
     async def _handle_window_update(self, stream_id: int, flags: int, delta: int) -> None:
         stream = self._streams.get(stream_id)
-        if flags & FLAG_SYN and stream is None:
-            stream = YamuxStream(self, stream_id)
-            self._streams[stream_id] = stream
-            await self._accept_queue.put(stream)
 
-        if stream is not None:
+        # Handle SYN in WINDOW_UPDATE frame (common in HashiCorp Yamux OpenStream)
+        if flags & FLAG_SYN:
+            if stream is None:
+                stream = YamuxStream(self, stream_id, state=STREAM_SYN_RECEIVED)
+                self._streams[stream_id] = stream
+                self._accept_queue.put_nowait(stream)
+
+        if stream is None:
+            return
+
+        if flags & FLAG_ACK:
+            stream._on_remote_ack()
+
+        if delta > 0:
             async with stream._window_cond:
                 stream._push_window_update(delta)
 
-            if flags & FLAG_RST:
-                stream._on_remote_rst()
-            elif flags & FLAG_FIN:
-                stream._on_remote_fin()
+        if flags & FLAG_RST:
+            stream._on_remote_rst()
+        elif flags & FLAG_FIN:
+            stream._on_remote_fin()
 
-    async def _handle_ping(self, flags: int, seq: int) -> None:
+    def _handle_ping(self, flags: int, seq: int) -> None:
         if flags & FLAG_ACK:
             # Acknowledgement of our ping
             fut = self._ping_futures.get(seq)
             if fut and not fut.done():
                 fut.set_result(None)
-        else:
-            # Inbound ping from peer: reflect back with ACK
-            try:
-                await self._send_frame(TYPE_PING, FLAG_ACK, 0, seq)
-            except Exception as e:
-                logger.debug(f"Failed to respond to peer ping: {e}")
+        elif flags & FLAG_SYN:
+            # Inbound ping from peer: respond with ACK in background task so recv loop doesn't stall
+            asyncio.create_task(self._send_ping_ack(seq))
+
+    async def _send_ping_ack(self, seq: int) -> None:
+        try:
+            await self._send_frame(TYPE_PING, FLAG_ACK, 0, seq)
+        except Exception as e:
+            logger.debug(f"Failed to respond to peer ping: {e}")
